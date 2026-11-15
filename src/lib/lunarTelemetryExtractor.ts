@@ -60,23 +60,161 @@ interface LoadedGlobalDem {
   grid: Int16Array;
 }
 
+const REPORT_DATA_LOGICAL_PREFIX = "report/lunar-report-dss/src/data/";
+
 let cachedPolarLola: LoadedPolarLola | null | undefined = undefined;
 let cachedGlobalDem: LoadedGlobalDem | null | undefined = undefined;
+let driveWarmupPromise: Promise<void> | null = null;
+
+function findRepoRootForDrive(): string {
+  const envManifest = process.env.GDRIVE_MANIFEST_PATH?.trim();
+  if (envManifest && fs.existsSync(envManifest)) {
+    return path.dirname(path.resolve(envManifest));
+  }
+  let cur = process.cwd();
+  for (let i = 0; i < 5; i++) {
+    if (fs.existsSync(path.join(cur, "drive-manifest.json"))) {
+      return cur;
+    }
+    const parent = path.dirname(cur);
+    if (parent === cur) break;
+    cur = parent;
+  }
+  return process.cwd();
+}
+
+function resolveReportCacheDataDir(): string {
+  const repoRoot = findRepoRootForDrive();
+  const cacheRoot = process.env.GDRIVE_CACHE_DIR?.trim()
+    ? path.resolve(process.env.GDRIVE_CACHE_DIR.trim())
+    : path.join(repoRoot, "cache", "gdrive");
+  return path.join(cacheRoot, "report", "lunar-report-dss", "src", "data");
+}
+
+function resolveReportDataFile(fileName: string): string | null {
+  const localDataDir = path.join(process.cwd(), "src/data");
+  const driveCacheDir = resolveReportCacheDataDir();
+  const customDir = process.env.LUNAR_REPORT_DATA_DIR?.trim();
+  const preferLocal = process.env.GDRIVE_PREFER_LOCAL === "1";
+
+  const dirs = preferLocal
+    ? [customDir, localDataDir, driveCacheDir]
+    : [customDir, driveCacheDir, localDataDir];
+
+  for (const dir of dirs) {
+    if (!dir) continue;
+    const candidate = path.join(dir, fileName);
+    if (fs.existsSync(candidate)) {
+      return candidate;
+    }
+  }
+  return null;
+}
+
+async function downloadReportFileFromDrive(fileId: string, targetPath: string, expectedSize?: number): Promise<boolean> {
+  const apiKey = process.env.GOOGLE_DRIVE_API_KEY?.trim();
+  const url = apiKey
+    ? `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?alt=media&key=${encodeURIComponent(apiKey)}`
+    : `https://drive.usercontent.google.com/download?id=${encodeURIComponent(fileId)}&export=download&confirm=t`;
+
+  try {
+    let res = await fetch(url, { redirect: "follow", signal: AbortSignal.timeout(120_000) });
+    const ctype = res.headers.get("content-type") || "";
+    if (res.ok && ctype.includes("text/html")) {
+      const html = await res.text();
+      const confirmMatch = /confirm=([0-9A-Za-z_-]+)/i.exec(html);
+      const uuidMatch = /uuid=([0-9A-Za-z_-]+)/i.exec(html);
+      if (!confirmMatch) return false;
+      const extra = uuidMatch ? `&uuid=${encodeURIComponent(uuidMatch[1])}` : "";
+      const confirmUrl = `https://drive.usercontent.google.com/download?id=${encodeURIComponent(fileId)}&export=download&confirm=${encodeURIComponent(confirmMatch[1])}${extra}`;
+      res = await fetch(confirmUrl, { redirect: "follow", signal: AbortSignal.timeout(120_000) });
+      if (res.ok && (res.headers.get("content-type") || "").includes("text/html")) {
+        await res.body?.cancel();
+        return false;
+      }
+    }
+    if (!res.ok) {
+      await res.body?.cancel();
+      return false;
+    }
+    const buf = Buffer.from(await res.arrayBuffer());
+    if (expectedSize && buf.byteLength !== expectedSize) {
+      return false;
+    }
+    fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+    const tmp = `${targetPath}.${process.pid}.${Date.now()}.tmp`;
+    fs.writeFileSync(tmp, buf);
+    fs.renameSync(tmp, targetPath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function ensureReportDriveBinariesLoaded(): Promise<void> {
+  if (driveWarmupPromise) return driveWarmupPromise;
+  driveWarmupPromise = (async () => {
+    const repoRoot = findRepoRootForDrive();
+    const manifestPath = process.env.GDRIVE_MANIFEST_PATH?.trim()
+      ? path.resolve(process.env.GDRIVE_MANIFEST_PATH.trim())
+      : path.join(repoRoot, "drive-manifest.json");
+    if (!fs.existsSync(manifestPath)) return;
+
+    try {
+      const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf-8")) as {
+        files?: Record<string, { fileId?: string; size?: number }>;
+      };
+      const entries = Object.entries(manifest.files || {}).filter(([k, v]) =>
+        k.startsWith(REPORT_DATA_LOGICAL_PREFIX) && Boolean(v?.fileId)
+      );
+      if (entries.length === 0) return;
+
+      const cacheDir = resolveReportCacheDataDir();
+      const localDir = path.join(process.cwd(), "src/data");
+      const preferLocal = process.env.GDRIVE_PREFER_LOCAL === "1";
+      let updated = false;
+
+      for (const [logicalPath, entry] of entries) {
+        const fileName = logicalPath.slice(REPORT_DATA_LOGICAL_PREFIX.length);
+        const localFile = path.join(localDir, fileName);
+        if (preferLocal && fs.existsSync(localFile)) continue;
+
+        const targetFile = path.join(cacheDir, fileName);
+        if (fs.existsSync(targetFile)) {
+          const stat = fs.statSync(targetFile);
+          if (!entry.size || stat.size === entry.size) continue;
+        }
+
+        if (entry.fileId) {
+          const ok = await downloadReportFileFromDrive(entry.fileId, targetFile, entry.size);
+          if (ok) updated = true;
+        }
+      }
+
+      if (updated) {
+        cachedPolarLola = undefined;
+        cachedGlobalDem = undefined;
+      }
+    } catch {
+      // Keep local or analytical fallback if manifest/network is unavailable
+    }
+  })();
+  return driveWarmupPromise;
+}
 
 function loadPolarLola(): LoadedPolarLola | null {
   if (cachedPolarLola !== undefined) return cachedPolarLola;
 
-  const dataDir = path.join(process.cwd(), "src/data");
-  const metaPath = path.join(dataDir, "lola-meta.json");
-  if (!fs.existsSync(metaPath)) {
+  const metaPath = resolveReportDataFile("lola-meta.json");
+  if (!metaPath) {
     cachedPolarLola = null;
     return null;
   }
 
   try {
     const meta = JSON.parse(fs.readFileSync(metaPath, "utf-8")) as LolaPolarMeta;
-    const horizonPath = path.join(dataDir, meta.horizonGridFile);
-    if (!fs.existsSync(horizonPath)) {
+    const horizonPath = resolveReportDataFile(meta.horizonGridFile);
+    if (!horizonPath) {
       cachedPolarLola = null;
       return null;
     }
@@ -90,8 +228,8 @@ function loadPolarLola(): LoadedPolarLola | null {
 
     const patches: LoadedPolarLola["patches"] = [];
     for (const [name, pMeta] of Object.entries(meta.patches)) {
-      const pPath = path.join(dataDir, pMeta.file);
-      if (fs.existsSync(pPath)) {
+      const pPath = resolveReportDataFile(pMeta.file);
+      if (pPath) {
         const pBuf = fs.readFileSync(pPath);
         patches.push({
           name,
@@ -112,17 +250,16 @@ function loadPolarLola(): LoadedPolarLola | null {
 function loadGlobalDem(): LoadedGlobalDem | null {
   if (cachedGlobalDem !== undefined) return cachedGlobalDem;
 
-  const dataDir = path.join(process.cwd(), "src/data");
-  const metaPath = path.join(dataDir, "lunar-global-meta.json");
-  if (!fs.existsSync(metaPath)) {
+  const metaPath = resolveReportDataFile("lunar-global-meta.json");
+  if (!metaPath) {
     cachedGlobalDem = null;
     return null;
   }
 
   try {
     const meta = JSON.parse(fs.readFileSync(metaPath, "utf-8")) as GlobalDemMeta;
-    const binPath = path.join(dataDir, meta.gridFile);
-    if (!fs.existsSync(binPath)) {
+    const binPath = resolveReportDataFile(meta.gridFile);
+    if (!binPath) {
       cachedGlobalDem = null;
       return null;
     }
@@ -961,6 +1098,7 @@ export async function extractLunarTelemetryAndSources(params: {
   const spec = MISSION_PROFILES[profileId];
   const totalHours = windowDays * 24;
 
+  await ensureReportDriveBinariesLoaded();
   const usePolarGridAzimuth = params.lat <= -81.0 && loadPolarLola() !== null;
   const topo = analyzeTopography(params.lat, params.lon);
 
